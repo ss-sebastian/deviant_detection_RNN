@@ -5,7 +5,7 @@ import torch.nn.functional as F
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 # Updated parameters
-input_size = 1               
+input_size = 3               
 sequence_length = 8 # 8 sounds in a sequence
 hidden_size = 64            
 num_layers = 2               
@@ -21,10 +21,16 @@ class GRUDeviantDetector(nn.Module):
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
         self.fc = nn.Linear(hidden_size, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, return_hidden=False):
         # x shape: (batch_size, sequence_length, input_size)
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        out, _ = self.gru(x, h0)  # out: (batch_size, seq_len, hidden_size) # hidden layer
+        out, hn = self.gru(x, h0)  # out: (batch_size, seq_len, hidden_size) # hidden layer
+        logits = self.fc(out[:, -1, :])
+        if return_hidden:            
+            # out: (batch, seq_len, hidden_size)
+            return logits, out
+        else:
+            return logits
 
         out = out[:, -1, :]  # last time step representation
 

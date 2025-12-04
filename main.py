@@ -25,18 +25,16 @@ class GRUDeviantDetector(nn.Module):
         # x shape: (batch_size, sequence_length, input_size)
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         out, hn = self.gru(x, h0)  # out: (batch_size, seq_len, hidden_size) # hidden layer
-        logits = self.fc(out[:, -1, :])
+        final_hidden = hn[-1]
+
+        logits = self.fc(final_hidden)
+
         if return_hidden:            
             # out: (batch, seq_len, hidden_size)
             return logits, out
         else:
             return logits
 
-        out = out[:, -1, :]  # last time step representation
-
-        out = self.fc(out)
-        return out
-    
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2, reduction='mean'):
         super(FocalLoss, self).__init__()

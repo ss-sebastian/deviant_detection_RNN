@@ -15,8 +15,8 @@ batch_size = 64
 max_epochs = 50          # upper bound (we have early-stopping)
 learning_rate = 0.002
 sigma = 0.01            
-val_ratio = 0.2          # ???not sure if we need this
-patience = 5             # early-stopping patience
+val_ratio = 0.2
+patience = 3             # early-stopping patience
 
 torch.manual_seed(42)
 
@@ -66,7 +66,7 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 
 # --------------------------
-# frequency transfrom and adding noises
+# Frequency transform and adding noise
 # --------------------------
 def frequencies_to_onehot(x: torch.Tensor) -> torch.Tensor:
     """
@@ -139,6 +139,7 @@ for epoch in range(1, max_epochs + 1):
         noisy_inputs = add_gaussian_noise(one_hot_inputs, sigma)
 
         optimizer.zero_grad()
+        # normal forward: logits only
         outputs = model(noisy_inputs)
 
         loss = criterion(outputs, labels)
@@ -167,7 +168,7 @@ for epoch in range(1, max_epochs + 1):
             one_hot_inputs = frequencies_to_onehot(inputs)
             noisy_inputs = add_gaussian_noise(one_hot_inputs, sigma)
 
-            outputs = model(noisy_inputs)
+            outputs = model(noisy_inputs)  # logits only
             loss = criterion(outputs, labels)
 
             val_loss += loss.item()
@@ -177,6 +178,12 @@ for epoch in range(1, max_epochs + 1):
 
     avg_val_loss = val_loss / len(val_loader)
     val_acc = 100.0 * val_correct / val_total
+
+    # record histories
+    train_loss_hist.append(avg_train_loss)
+    val_loss_hist.append(avg_val_loss)
+    train_acc_hist.append(train_acc)
+    val_acc_hist.append(val_acc)
 
     print(
         f"Epoch {epoch:02d} | "
@@ -207,6 +214,44 @@ if best_state_dict is not None:
 save_path = "/users/seb/Desktop/bcbl/msc_thesis/gru_deviant_lr_0p002_earlystop.pth"
 torch.save(model.state_dict(), save_path)
 print(f"Saved best model to: {save_path}")
+
+
+# --------------------------
+# Extract & save validation final hidden states (best model)
+# --------------------------
+model.eval()
+val_hidden_list = []
+val_labels_list = []
+
+with torch.no_grad():
+    for inputs, labels in val_loader:
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+
+        one_hot_inputs = frequencies_to_onehot(inputs)
+        noisy_inputs = add_gaussian_noise(one_hot_inputs, sigma)
+
+        # IMPORTANT: ask model for final hidden state
+        logits, final_hidden = model(noisy_inputs, return_hidden=True)
+        # final_hidden: (batch, hidden_size)
+
+        val_hidden_list.append(final_hidden.detach().cpu())
+        val_labels_list.append(labels.detach().cpu())
+
+val_hidden_tensor = torch.cat(val_hidden_list, dim=0)   # (n_val, hidden_size)
+val_labels_tensor = torch.cat(val_labels_list, dim=0)   # (n_val,)
+
+hidden_save_path = "/users/seb/Desktop/bcbl/msc_thesis/val_final_hidden.pt"
+torch.save(
+    {"hidden": val_hidden_tensor, "labels": val_labels_tensor},
+    hidden_save_path
+)
+print(
+    f"Saved validation final hidden states to: {hidden_save_path} "
+    f"with shape {val_hidden_tensor.shape}"
+)
+
+
 # --------------------------
 # Plots
 # --------------------------

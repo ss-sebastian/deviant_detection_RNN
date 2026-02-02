@@ -147,7 +147,7 @@ def _run_block_through_tbptt(
         L = e - s
         if compute_pred_loss and L >= 2:
             # predict x[t+1] from h[t] inside this chunk
-            pred_loss_accum = pred_loss_accum + huber(x_hat[:, :-1, :], x[:, s+1:e, :])
+            pred_loss_accum = pred_loss_accum + huber(x_hat[:, :-1, :].contiguous(), x[:, s+1:e, :].contiguous())
 
         # collect trial-end states within [s, e)
         mask = (end_idx >= s) & (end_idx < e)
@@ -202,7 +202,7 @@ def train_one_epoch(
             x=x,
             end_idx=end_idx,
             chunk_len=chunk_len,
-            compute_pred_loss=True,
+            compute_pred_loss=(lambda_pred > 0),
             huber=huber,
         )
 
@@ -302,7 +302,8 @@ def main():
     p.add_argument("--data_dir", type=str, required=True)
     p.add_argument("--save_dir", type=str, required=True)
 
-    # ✅ new: choose which tensor files to use
+    p.add_argument("--device", type=str, default="auto",
+               help="auto | cuda | mps | cpu")
     p.add_argument("--input_pt", type=str, default="ms_input_tensor.pt",
                    help="Input tensor filename inside data_dir (e.g., ms_input_tensor.pt or gt_input_tensor.pt)")
     p.add_argument("--label_pt", type=str, default="ms_labels_tensor.pt",
@@ -324,7 +325,6 @@ def main():
 
     p.add_argument("--val_split", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     args = p.parse_args()
     torch.manual_seed(args.seed)
@@ -350,7 +350,20 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    device = torch.device(args.device)
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    print(f"[device] using: {device}")
+    if device.type == "cuda":
+        print(f"[cuda] name: {torch.cuda.get_device_name(0)}")
+        print(f"[cuda] capability: {torch.cuda.get_device_capability(0)}")
 
     cfg = ModelConfig(
         input_dim=ds.input_dim,

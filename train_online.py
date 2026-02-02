@@ -7,12 +7,12 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Tuple, Optional, Literal
-
+import torch_xla.core.xla_model as xm
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-
+import torch_xla.distributed.parallel_loader as pl
 from model import PredictiveGRU, ModelConfig
 
 
@@ -554,7 +554,13 @@ def train_one_epoch(
         total_loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        if device.type == "xla":
+            import torch_xla.core.xla_model as xm
+            xm.optimizer_step(optimizer)
+            xm.mark_step()
+        else:
+            optimizer.step()
+
 
         total_cls += float(cls_loss.item()) * B
         total_pred += float(pred_loss_accum.item()) * B
@@ -639,6 +645,11 @@ def resolve_device(device_str: str) -> torch.device:
         return torch.device("cpu")
     return torch.device(device_str)
 
+    if device_str in ["tpu", "xla"]:
+        return xm.xla_device()
+
+    return torch.device(device_str)
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -652,7 +663,7 @@ def main():
     p.add_argument("--seed", type=int, default=42)
 
     # device
-    p.add_argument("--device", type=str, default="auto", help="auto | cuda | mps | cpu")
+    p.add_argument("--device", type=str, default="auto", help="auto | cuda | mps | cpu | xla(tpu)")
 
     # training
     p.add_argument("--epochs", type=int, default=10)
@@ -701,6 +712,8 @@ def main():
     p.add_argument("--resume", type=str, default="", help="Path to checkpoint .pt (best.pt/last.pt)")
 
     args = p.parse_args()
+
+    # Seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -713,8 +726,11 @@ def main():
     if device.type == "cuda":
         print(f"[cuda] name: {torch.cuda.get_device_name(0)}")
         print(f"[cuda] capability: {torch.cuda.get_device_capability(0)}")
+    if device.type == "xla":
+        import torch_xla.core.xla_model as xm
+        print(f"[xla] ordinal={xm.get_ordinal()} world_size={xm.xrt_world_size()}")
 
-    # dataset
+    # dataset (compact blocks -> on-the-fly ms rendering)
     ds = OnlineRenderDataset(
         data_dir=data_dir,
         frontend=args.frontend,
@@ -751,13 +767,15 @@ def main():
         generator=torch.Generator().manual_seed(args.seed),
     )
 
+    # NOTE: XLA + multiprocessing dataloader can be fragile; start with num_workers=0
+    pin = (device.type == "cuda")
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=False,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=pin,
     )
     val_loader = DataLoader(
         val_ds,
@@ -765,8 +783,12 @@ def main():
         shuffle=False,
         drop_last=False,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=pin,
     )
+
+    # Wrap loaders for XLA
+    train_loader = maybe_wrap_xla_loader(train_loader, device)
+    val_loader = maybe_wrap_xla_loader(val_loader, device)
 
     # model
     cfg = ModelConfig(
@@ -795,7 +817,7 @@ def main():
                 "data_dir": str(data_dir),
                 "frontend": args.frontend,
                 "dataset": {
-                    "layout": ds.layout,
+                    "layout": getattr(ds, "layout", "unknown"),
                     "n_blocks": n,
                     "tone_ms": ds.tone_ms,
                     "isi_ms": ds.isi_ms,
@@ -804,6 +826,7 @@ def main():
                     "T": ds.T,
                     "input_dim": ds.input_dim,
                 },
+                "device": str(device),
                 "model_cfg": asdict(cfg),
                 "train_args": vars(args),
             },
@@ -844,10 +867,20 @@ def main():
             "cfg": asdict(cfg),
             "args": vars(args),
         }
-        torch.save(ckpt, save_dir / "last.pt")
-        if va["total_loss"] < best_val:
-            best_val = va["total_loss"]
-            torch.save(ckpt, save_dir / "best.pt")
+
+        # Saving on XLA: only master should write to disk
+        if device.type == "xla":
+            import torch_xla.core.xla_model as xm
+            if xm.is_master_ordinal():
+                torch.save(ckpt, save_dir / "last.pt")
+                if va["total_loss"] < best_val:
+                    best_val = va["total_loss"]
+                    torch.save(ckpt, save_dir / "best.pt")
+        else:
+            torch.save(ckpt, save_dir / "last.pt")
+            if va["total_loss"] < best_val:
+                best_val = va["total_loss"]
+                torch.save(ckpt, save_dir / "best.pt")
 
     print("Saved checkpoints to:", save_dir.resolve())
     print(" - best.pt")

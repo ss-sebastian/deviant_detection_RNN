@@ -51,44 +51,55 @@ def main():
 
     if x.ndim != 3 or tuple(x.shape[1:]) != (10, 8):
         raise ValueError(f"Expected input_tensor shape (1,10,8). Got {tuple(x.shape)}")
+    if y.ndim != 2 or tuple(y.shape) != (1, 10):
+        raise ValueError(f"Expected labels_tensor shape (1,10). Got {tuple(y.shape)}")
 
     trials = x[0].float()  # (10,8)
     rendered = [render_trial_ms(trials[i], args.tone_ms, args.isi_ms) for i in range(10)]
-    block_ms = torch.cat(rendered, dim=0)  # (T,2)
 
     trial_T = rendered[0].shape[0]
-    if trial_T != 7 * (args.tone_ms + args.isi_ms) + args.tone_ms:
-        raise RuntimeError("Trial length mismatch.")
+    expected_T = 7 * (args.tone_ms + args.isi_ms) + args.tone_ms
+    if trial_T != expected_T:
+        raise RuntimeError(f"Trial length mismatch: got {trial_T}, expected {expected_T}")
+
+    # ✅ trialwise tensor: (10, trial_T, 2)
+    trial_ms = torch.stack(rendered, dim=0)
 
     if args.add_trial_start:
-        # output: (T,3) -> [erb_value, is_tone, trial_start]
-        out = torch.zeros((block_ms.shape[0], 3), dtype=torch.float32)
-        out[:, :2] = block_ms
-        for i in range(10):
-            out[i * trial_T, 2] = 1.0
+        # output: (10, trial_T, 3) -> [erb_value, is_tone, trial_start]
+        out = torch.zeros((trial_ms.shape[0], trial_ms.shape[1], 3), dtype=torch.float32)
+        out[:, :, :2] = trial_ms
+        out[:, 0, 2] = 1.0  # start of each trial
+        features = ["erb_value", "is_tone", "trial_start"]
     else:
-        out = block_ms  # (T,2)
+        out = trial_ms  # (10, trial_T, 2)
+        features = ["erb_value", "is_tone"]
 
-    out = out.unsqueeze(0)  # (1,T,D)
+    # add batch dim so it is consistent with your previous style
+    # final: (1, 10, trial_T, D)
+    out = out.unsqueeze(0)
 
     # Save
     torch.save(out, in_dir / args.save_name)
     torch.save(y, in_dir / "ms_labels_tensor.pt")
 
-    # Also save indices for convenient readout at trial end
-    # End indices in the block (0-index): (i+1)*trial_T - 1
-    end_idx = torch.tensor([(i + 1) * trial_T - 1 for i in range(10)], dtype=torch.long)
+    # trial end index within each trial (0-indexed)
+    # Here every trial has same length, so end index is constant.
+    # Save as shape (10,) for convenience
+    end_idx = torch.tensor([trial_T - 1] * 10, dtype=torch.long)
     torch.save(end_idx, in_dir / "trial_end_indices.pt")
 
     meta = {
+        "mode": "trialwise",
         "tone_ms": args.tone_ms,
         "isi_ms": args.isi_ms,
         "ms_per_trial": int(trial_T),
         "trials_per_block": 10,
-        "block_T": int(out.shape[1]),
-        "features": ["erb_value", "is_tone"] + (["trial_start"] if args.add_trial_start else []),
+        "output_shape": list(out.shape),  # [1,10,trial_T,D]
+        "features": features,
         "labels": "deviant position per trial (1-indexed in {4,5,6})",
         "trial_end_indices_file": "trial_end_indices.pt",
+        "note": "Each trial is one input sample; concatenate in training loop if you want stateful trial-to-trial learning.",
     }
     (in_dir / "ms_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 

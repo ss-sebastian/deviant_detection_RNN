@@ -365,8 +365,8 @@ def main():
             stds.append(f_std)
             devs.append(f_dev)
 
-        torch.save(X_all, save_dir / "input_blocks.pt")
-        torch.save(Y_all, save_dir / "labels_blocks.pt")
+        torch.save(X_all, save_dir / "data" / "input_blocks.pt")
+        torch.save(Y_all, save_dir / "data" / "labels_blocks.pt")
 
         meta = asdict(cfg)
         meta.update({

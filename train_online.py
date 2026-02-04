@@ -7,12 +7,12 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Tuple, Optional, Literal
-import torch_xla.core.xla_model as xm
+# import torch_xla.core.xla_model as xm
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import torch_xla.distributed.parallel_loader as pl
+# import torch_xla.distributed.parallel_loader as pl
 from model import PredictiveGRU, ModelConfig
 
 
@@ -462,98 +462,199 @@ class OnlineRenderDataset(Dataset):
 # -------------------------
 # Train / Eval with TBPTT
 # -------------------------
+def make_rt_targets_and_mask(
+    abs_t: torch.Tensor,         # (L,) absolute time indices in [0, T)
+    y_pos_456: torch.Tensor,     # (B,10) in {4,5,6}
+    trial_T: int,
+    tone_ms: int,
+    isi_ms: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build per-ms targets for rt_head and a mask to ignore silence.
+
+    Returns:
+      target: (B,L) long in {0,1}    1 means "deviant tone" at this ms
+      mask:   (B,L) bool            True only for tone segments
+    """
+    # which trial does each ms belong to?
+    trial_id = (abs_t // trial_T).long()     # (L,) values 0..9
+    within = (abs_t % trial_T).long()        # (L,) within-trial time
+
+    step = tone_ms + isi_ms
+
+    tone_id = (within // step).clamp_max(7)  # (L,) 0..7 (8 tones)
+    phase = (within % step)                  # (L,)
+    is_tone = (phase < tone_ms)              # (L,) tone vs silence
+
+    # deviant tone index in 0-based: y in {4,5,6} -> {3,4,5}
+    dev_idx = (y_pos_456 - 1).long()         # (B,10)
+
+    # expand to (B,L)
+    dev_for_t = dev_idx[:, trial_id]         # (B,L)
+    tone_for_t = tone_id.unsqueeze(0).expand_as(dev_for_t)
+
+    target = (tone_for_t == dev_for_t).long()    # (B,L)
+    mask = is_tone.unsqueeze(0).expand_as(target) # (B,L)
+    return target, mask
+
 def _run_block_through_tbptt(
     model: PredictiveGRU,
     x: torch.Tensor,                 # (B,T,D)
+    y_pos_456: torch.Tensor,         # (B,10) values in {4,5,6}  (for RT supervision)
     end_idx: torch.Tensor,           # (10,) on device
     chunk_len: int,
     compute_pred_loss: bool,
     huber: nn.Module,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    # --- RT head supervision ---
+    rt_ce: nn.Module,                # CrossEntropyLoss
+    tone_ms: int,
+    isi_ms: int,
+    trial_T_ms: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns:
       h_end: (B,10,H) trial-end hidden states
       pred_loss_accum: scalar tensor (0 if compute_pred_loss=False)
+      rt_loss_accum: scalar tensor (tone-only CE accumulated across chunks)
     """
     B, T, D = x.shape
     h = None
     collected = []
     pred_loss_accum = x.new_tensor(0.0)
+    rt_loss_accum = x.new_tensor(0.0)
 
     for s in range(0, T, chunk_len):
         e = min(s + chunk_len, T)   # exclusive
         x_in = x[:, s:e, :]
-        h_seq, h, x_hat = model.forward_chunk(x_in, h0=h)  # (B,L,H), (B,L,D)
-
+        h_seq, h, x_hat = model.forward_chunk(x_in, h0=h)  # h_seq: (B,L,H)
         L = e - s
+
+        # ---- next-step prediction loss (optional)
         if compute_pred_loss and L >= 2:
-            # robust to non-contiguous tensors: reshape instead of view
             pred_in = x_hat[:, :-1, :].reshape(-1, D)
             pred_tg = x[:, s+1:e, :].reshape(-1, D)
             pred_loss_accum = pred_loss_accum + huber(pred_in, pred_tg)
 
-        mask = (end_idx >= s) & (end_idx < e)
+        # ---- RT head loss (tone-only)
+        # logits: (B,L,2)
+        rt_logits = model.classify_rt_from_seq(h_seq)
+
+        abs_t = torch.arange(s, e, device=x.device)  # (L,)
+        target, mask = make_rt_targets_and_mask(
+            abs_t=abs_t,
+            y_pos_456=y_pos_456,
+            trial_T=trial_T_ms,
+            tone_ms=int(tone_ms),
+            isi_ms=int(isi_ms),
+        )
+        target = target.to(device=x.device)
+        mask = mask.to(device=x.device)
+        rt_loss_sum = x.new_tensor(0.0)
+        rt_count = x.new_tensor(0.0)
         if mask.any():
-            rel = (end_idx[mask] - s).long()
+            # rt_ce expects (N,2) and (N,)
+            per = rt_ce(rt_logits[mask], target[mask])
+            rt_loss_sum = rt_loss_sum + per.sum()
+            rt_count = rt_count + per.numel()
+        
+        rt_loss_accum = rt_loss_sum / (rt_count + 1e-8)
+        
+        # ---- collect trial-end states (unchanged)
+        m_end = (end_idx >= s) & (end_idx < e)
+        if m_end.any():
+            rel = (end_idx[m_end] - s).long()
             hs = h_seq.index_select(dim=1, index=rel)
             collected.append(hs)
 
+        # ---- TBPTT truncate
         h = h.detach()
 
     if len(collected) == 0:
         raise RuntimeError("No trial-end states collected. Check end_idx and T.")
 
     h_end = torch.cat(collected, dim=1)  # (B,10,H)
-    return h_end, pred_loss_accum
-
+    return h_end, pred_loss_accum, rt_loss_accum
 
 def train_one_epoch(
     model: PredictiveGRU,
-    loader: DataLoader,
+    loader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     chunk_len: int,
     lambda_pred: float,
+    lambda_rt: float,
     grad_clip: float,
+    tone_ms: int,
+    isi_ms: int,
+    trial_T_ms: int,
+    debug: bool = False,
+    debug_steps: int = 0,
 ) -> dict:
     model.train()
     huber = nn.SmoothL1Loss(reduction="mean")
     ce = nn.CrossEntropyLoss(reduction="mean")
+    rt_ce = nn.CrossEntropyLoss(reduction="mean")
 
     total_cls = 0.0
     total_pred = 0.0
+    total_rt = 0.0
     total = 0
     correct = 0
+    n_examples = 0
 
     compute_pred = lambda_pred > 0
+    compute_rt = lambda_rt > 0
 
+    step = 0
     for x, y in loader:
-        x = x.to(device)  # (B,T,D)
-        y = y.to(device)  # (B,10)
+        step += 1
+
+        x = x.to(device, non_blocking=True)  # (B,T,D)
+        y = y.to(device, non_blocking=True)  # (B,10) in {4,5,6}
         B, T, D = x.shape
+        n_examples += B
 
         end_idx = infer_end_indices_from_T(T, trials_per_block=10).to(device)
 
         optimizer.zero_grad(set_to_none=True)
 
-        h_end, pred_loss_accum = _run_block_through_tbptt(
+        # --- debug: snapshot a parameter before update
+        w0 = None
+        if debug and step <= int(debug_steps):
+            w = next(model.parameters())
+            w0 = w.detach().float().cpu().clone()
+
+        # --- TBPTT run (now also returns rt_loss_accum)
+        h_end, pred_loss_accum, rt_loss_accum = _run_block_through_tbptt(
             model=model,
             x=x,
+            y_pos_456=y,
             end_idx=end_idx,
             chunk_len=chunk_len,
             compute_pred_loss=compute_pred,
             huber=huber,
+            rt_ce=rt_ce,
+            tone_ms=int(tone_ms),
+            isi_ms=int(isi_ms),
+            trial_T_ms=int(trial_T_ms),
         )
 
         logits = model.classify_from_states(h_end)  # (B,10,3)
-        y_cls = labels_to_class_index(y)
+        y_cls = labels_to_class_index(y)            # (B,10) -> {0,1,2}
 
         cls_loss = ce(logits.reshape(-1, 3), y_cls.reshape(-1))
-        total_loss = cls_loss + float(lambda_pred) * pred_loss_accum
+
+        total_loss = cls_loss
+        if compute_pred:
+            total_loss = total_loss + float(lambda_pred) * pred_loss_accum
+        if compute_rt:
+            total_loss = total_loss + float(lambda_rt) * rt_loss_accum
 
         total_loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        # --- step
         if device.type == "xla":
             import torch_xla.core.xla_model as xm
             xm.optimizer_step(optimizer)
@@ -561,19 +662,38 @@ def train_one_epoch(
         else:
             optimizer.step()
 
-
         total_cls += float(cls_loss.item()) * B
         total_pred += float(pred_loss_accum.item()) * B
+        total_rt += float(rt_loss_accum.item()) * B
 
         pred = logits.argmax(dim=-1)
         correct += int((pred == y_cls).sum().item())
         total += int(y_cls.numel())
 
-    denom = max(1, len(loader.dataset))
+        # --- debug: check parameter actually changed
+        if debug and step <= int(debug_steps):
+            w1 = next(model.parameters()).detach().float().cpu()
+            delta = (w1 - w0).abs().mean().item() if w0 is not None else float("nan")
+            batch_acc = (pred == y_cls).float().mean().item()
+            print(
+                f"[debug step {step}] mean|Δparam|={delta:.6e} "
+                f"cls={cls_loss.item():.4f} pred={float(pred_loss_accum.item()):.4f} rt={float(rt_loss_accum.item()):.4f} "
+                f"acc={batch_acc:.3f} logits_mean={logits.detach().float().mean().item():.4f}"
+            )
+
+    denom = max(1, n_examples)
+    # keep your old total_loss definition style, but now includes rt
+    avg_total = total_cls
+    if compute_pred:
+        avg_total += float(lambda_pred) * total_pred
+    if compute_rt:
+        avg_total += float(lambda_rt) * total_rt
+
     return {
         "cls_loss": total_cls / denom,
         "pred_loss": total_pred / denom,
-        "total_loss": (total_cls + float(lambda_pred) * total_pred) / denom,
+        "rt_loss": total_rt / denom,
+        "total_loss": avg_total / denom,
         "acc": correct / max(1, total),
     }
 
@@ -581,54 +701,77 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(
     model: PredictiveGRU,
-    loader: DataLoader,
+    loader,
     device: torch.device,
     chunk_len: int,
     lambda_pred: float,
+    lambda_rt: float,
+    tone_ms: int,
+    isi_ms: int,
+    trial_T_ms: int,
 ) -> dict:
     model.eval()
     huber = nn.SmoothL1Loss(reduction="mean")
     ce = nn.CrossEntropyLoss(reduction="mean")
+    rt_ce = nn.CrossEntropyLoss(reduction="mean")
 
     total_cls = 0.0
     total_pred = 0.0
+    total_rt = 0.0
     total = 0
     correct = 0
+    n_examples = 0
 
     compute_pred = lambda_pred > 0
+    compute_rt = lambda_rt > 0
 
     for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         B, T, D = x.shape
+        n_examples += B
 
         end_idx = infer_end_indices_from_T(T, trials_per_block=10).to(device)
 
-        h_end, pred_loss_accum = _run_block_through_tbptt(
+        h_end, pred_loss_accum, rt_loss_accum = _run_block_through_tbptt(
             model=model,
             x=x,
+            y_pos_456=y,
             end_idx=end_idx,
             chunk_len=chunk_len,
             compute_pred_loss=compute_pred,
             huber=huber,
+            rt_ce=rt_ce,
+            tone_ms=int(tone_ms),
+            isi_ms=int(isi_ms),
+            trial_T_ms=int(trial_T_ms),
         )
 
         logits = model.classify_from_states(h_end)
         y_cls = labels_to_class_index(y)
 
         cls_loss = ce(logits.reshape(-1, 3), y_cls.reshape(-1))
+
         total_cls += float(cls_loss.item()) * B
         total_pred += float(pred_loss_accum.item()) * B
+        total_rt += float(rt_loss_accum.item()) * B
 
         pred = logits.argmax(dim=-1)
         correct += int((pred == y_cls).sum().item())
         total += int(y_cls.numel())
 
-    denom = max(1, len(loader.dataset))
+    denom = max(1, n_examples)
+    avg_total = total_cls
+    if compute_pred:
+        avg_total += float(lambda_pred) * total_pred
+    if compute_rt:
+        avg_total += float(lambda_rt) * total_rt
+
     return {
         "cls_loss": total_cls / denom,
         "pred_loss": total_pred / denom,
-        "total_loss": (total_cls + float(lambda_pred) * total_pred) / denom,
+        "rt_loss": total_rt / denom,
+        "total_loss": avg_total / denom,
         "acc": correct / max(1, total),
     }
 
@@ -637,18 +780,32 @@ def evaluate(
 # Main
 # -------------------------
 def resolve_device(device_str: str) -> torch.device:
-    if device_str == "auto":
+    s = device_str.lower()
+    if s == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
         if torch.backends.mps.is_available():
             return torch.device("mps")
+        # TPU 在 auto 不会自动选，避免误用；想用 TPU 请显式 --device xla
         return torch.device("cpu")
-    return torch.device(device_str)
 
-    if device_str in ["tpu", "xla"]:
+    if s in ["xla", "tpu"]:
+        import torch_xla.core.xla_model as xm
         return xm.xla_device()
 
-    return torch.device(device_str)
+    return torch.device(s)
+
+
+def maybe_wrap_xla_loader(loader, device: torch.device):
+    """
+    Wrap a PyTorch DataLoader with MpDeviceLoader when using XLA/TPU.
+    This improves host->device transfer and is the recommended pattern in torch_xla.
+    """
+    if device.type == "xla":
+        import torch_xla.distributed.parallel_loader as pl
+        return pl.MpDeviceLoader(loader, device)
+    return loader
+
 
 
 def main():
@@ -680,6 +837,7 @@ def main():
     p.add_argument("--layer_norm", action="store_true")
 
     # tbptt + losses
+    p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--chunk_len", type=int, default=1000)
     p.add_argument("--lambda_pred", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -711,6 +869,13 @@ def main():
     # resume
     p.add_argument("--resume", type=str, default="", help="Path to checkpoint .pt (best.pt/last.pt)")
 
+    # debug / sanity
+    p.add_argument("--debug", action="store_true", help="Enable debug prints/checks (slower).")
+    p.add_argument("--debug_steps", type=int, default=3, help="How many first steps to run debug prints.")
+    p.add_argument("--debug_xy", action="store_true", help="Check X-Y alignment (deviant pos) on a sample.")
+    p.add_argument("--debug_xy_n", type=int, default=200, help="How many (block,trial) to sample for X-Y check.")
+    p.add_argument("--max_blocks", type=int, default=0, help="If >0, restrict dataset to first N blocks (overfit sanity).")
+
     args = p.parse_args()
 
     # Seeds
@@ -726,9 +891,29 @@ def main():
     if device.type == "cuda":
         print(f"[cuda] name: {torch.cuda.get_device_name(0)}")
         print(f"[cuda] capability: {torch.cuda.get_device_capability(0)}")
+
+    ordinal = None  # for xla master fallback
+    world_size = 1
     if device.type == "xla":
         import torch_xla.core.xla_model as xm
-        print(f"[xla] ordinal={xm.get_ordinal()} world_size={xm.xrt_world_size()}")
+
+        if hasattr(xm, "get_ordinal"):
+            ordinal = xm.get_ordinal()
+        elif hasattr(xm, "ordinal"):
+            ordinal = xm.ordinal()
+        elif hasattr(xm, "get_local_ordinal"):
+            ordinal = xm.get_local_ordinal()
+        else:
+            ordinal = -1
+
+        if hasattr(xm, "xrt_world_size"):
+            world_size = xm.xrt_world_size()
+        elif hasattr(xm, "world_size"):
+            world_size = xm.world_size()
+        else:
+            world_size = 1
+
+        print(f"[xla] ordinal={ordinal} world_size={world_size}")
 
     # dataset (compact blocks -> on-the-fly ms rendering)
     ds = OnlineRenderDataset(
@@ -755,6 +940,72 @@ def main():
         smooth_ms=args.smooth_ms,
     )
 
+    # -------------------------
+    # Debug / sanity: dataset checks
+    # -------------------------
+    if args.max_blocks and args.max_blocks > 0:
+        m = min(int(args.max_blocks), int(ds.B))
+        ds.X = ds.X[:m]
+        ds.Y = ds.Y[:m]
+        ds.B = m
+        print(f"[debug] max_blocks applied: B={ds.B}")
+
+    vals, counts = torch.unique(ds.Y, return_counts=True)
+    print("[data] unique Y values:", list(zip(vals.tolist(), counts.tolist())))
+    if not set(vals.tolist()).issubset({4, 5, 6}):
+        print("[WARN] Y contains values outside {4,5,6}. labels_to_class_index(y-4) will be wrong.")
+
+    try:
+        end_preview = infer_end_indices_from_T(int(ds.T), trials_per_block=10)
+        print(f"[data] T={ds.T} trial_T={ds.trial_T_ms} end_idx preview: "
+              f"{end_preview[:3].tolist()} ... {end_preview[-3:].tolist()}")
+    except Exception as e:
+        print("[WARN] cannot infer end indices from ds.T:", repr(e))
+
+    def _deviant_pos_from_freqs(freqs8: torch.Tensor):
+        uniq, cnt = torch.unique(freqs8.cpu(), return_counts=True)
+        if uniq.numel() != 2:
+            return None
+        dev_freq = uniq[cnt.argmin()]
+        idx = (freqs8.cpu() == dev_freq).nonzero(as_tuple=False).view(-1)
+        if idx.numel() != 1:
+            return None
+        return int(idx.item()) + 1  # 1-based
+
+    if args.debug_xy:
+        ncheck = min(int(args.debug_xy_n), int(ds.B) * 10)
+        ok = 0
+        mismatch = 0
+        bad_pattern = 0
+        checked = 0
+
+        n_blocks_to_scan = min(ds.B, int(math.ceil(ncheck / 10)))
+        for b in range(n_blocks_to_scan):
+            for t in range(10):
+                if checked >= ncheck:
+                    break
+                pos = _deviant_pos_from_freqs(ds.X[b, t])
+                y = int(ds.Y[b, t].item())
+                checked += 1
+                if pos is None:
+                    bad_pattern += 1
+                else:
+                    if pos == y:
+                        ok += 1
+                    else:
+                        mismatch += 1
+            if checked >= ncheck:
+                break
+
+        print(f"[debug_xy] checked={checked} ok={ok} mismatch={mismatch} bad_pattern={bad_pattern}")
+        if mismatch > 0:
+            print("[WARN] X-Y mismatch: label may not match deviant position encoded in X.")
+        if bad_pattern > 0:
+            print("[WARN] Some trials are not 7+1 pattern (unique!=2 or dev not unique).")
+
+    # -------------------------
+    # Split
+    # -------------------------
     n = len(ds)
     n_val = max(1, int(round(n * args.val_split)))
     n_train = n - n_val
@@ -767,7 +1018,6 @@ def main():
         generator=torch.Generator().manual_seed(args.seed),
     )
 
-    # NOTE: XLA + multiprocessing dataloader can be fragile; start with num_workers=0
     pin = (device.type == "cuda")
     train_loader = DataLoader(
         train_ds,
@@ -845,6 +1095,12 @@ def main():
             chunk_len=int(args.chunk_len),
             lambda_pred=float(args.lambda_pred),
             grad_clip=float(args.grad_clip),
+            debug=bool(args.debug),
+            debug_steps=int(args.debug_steps),
+            lambda_rt=0.1,
+            tone_ms=int(args.tone_ms),
+            isi_ms=int(args.isi_ms),
+            trial_T_ms=int(ds.trial_T_ms),
         )
         va = evaluate(
             model=model,
@@ -852,12 +1108,16 @@ def main():
             device=device,
             chunk_len=int(args.chunk_len),
             lambda_pred=float(args.lambda_pred),
+            lambda_rt=0.1,
+            tone_ms=int(args.tone_ms),
+            isi_ms=int(args.isi_ms),
+            trial_T_ms=int(ds.trial_T_ms),
         )
 
         print(
             f"[epoch {epoch:03d}] "
-            f"train: loss={tr['total_loss']:.4f} cls={tr['cls_loss']:.4f} pred={tr['pred_loss']:.4f} acc={tr['acc']:.4f} | "
-            f"val: loss={va['total_loss']:.4f} cls={va['cls_loss']:.4f} pred={va['pred_loss']:.4f} acc={va['acc']:.4f}"
+            f"train: loss={tr['total_loss']:.4f} cls={tr['cls_loss']:.4f} pred={tr['pred_loss']:.4f} rt={tr['rt_loss']:.4f} acc={tr['acc']:.4f} | "
+            f"val: loss={va['total_loss']:.4f} cls={va['cls_loss']:.4f} pred={va['pred_loss']:.4f} rt={va['rt_loss']:.4f} acc={va['acc']:.4f}"
         )
 
         ckpt = {
@@ -868,10 +1128,15 @@ def main():
             "args": vars(args),
         }
 
-        # Saving on XLA: only master should write to disk
+        # Saving on XLA: only master should write to disk (compat)
         if device.type == "xla":
             import torch_xla.core.xla_model as xm
-            if xm.is_master_ordinal():
+            is_master = True
+            if hasattr(xm, "is_master_ordinal"):
+                is_master = xm.is_master_ordinal()
+            elif ordinal is not None:
+                is_master = (int(ordinal) == 0)
+            if is_master:
                 torch.save(ckpt, save_dir / "last.pt")
                 if va["total_loss"] < best_val:
                     best_val = va["total_loss"]

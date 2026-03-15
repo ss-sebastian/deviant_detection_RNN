@@ -19,14 +19,12 @@ class ModelConfig:
 
 class PredictiveGRU(nn.Module):
     """
-    One GRU backbone, three heads:
-      - pred_head: predict x_{t+1} from h_t (next-step prediction)
-      - cls_head:  classify dev_pos at trial end states h_{t_end} -> {4,5,6}
-      - rt_head:   classify deviant vs standard at each time step (for RT readout)
+    One GRU backbone, one shared 3-class head (classes correspond to dev_pos {4,5,6}):
 
-    Notes:
-      - cls_head outputs 3 logits corresponding to classes [4,5,6]
-      - rt_head outputs 2 logits corresponding to classes [standard, deviant]
+      - token_head: logits at each token (B,L,3)
+      - trial_end:  logits at selected end states (B,N_trials,3) using the same head
+
+    No binary rt_head anymore. RT is computed from token logits during evaluation.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -42,65 +40,39 @@ class PredictiveGRU(nn.Module):
         )
 
         self.ln = nn.LayerNorm(cfg.hidden_dim) if cfg.layer_norm else nn.Identity()
+        self.head = nn.Linear(cfg.hidden_dim, 3)  # classes: {4,5,6} -> indices {0,1,2}
 
-        # Heads
-        self.pred_head = nn.Linear(cfg.hidden_dim, cfg.input_dim)
-        self.cls_head = nn.Linear(cfg.hidden_dim, 3)
-        self.rt_head = nn.Linear(cfg.hidden_dim, 2)  # [standard, deviant]
-
-    def _ensure_h0(
-        self,
-        x_chunk: torch.Tensor,
-        h0: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Ensure h0 is on the same device/dtype as x_chunk.
-        Critical for XLA/TPU where GRU may be implemented via scan.
-        """
+    def _ensure_h0(self, x_chunk: torch.Tensor, h0: Optional[torch.Tensor]) -> torch.Tensor:
         B = int(x_chunk.shape[0])
         device = x_chunk.device
         dtype = x_chunk.dtype
-
         if h0 is None:
             return torch.zeros(
                 (self.cfg.num_layers, B, self.cfg.hidden_dim),
                 device=device,
                 dtype=dtype,
             )
-
         return h0.to(device=device, dtype=dtype)
 
     def forward_chunk(
         self,
-        x_chunk: torch.Tensor,
+        x_chunk: torch.Tensor,           # (B,L,D)
         h0: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        x_chunk: (B, L, D)
-        h0: (num_layers, B, H) or None
-
         returns:
-          h_seq: (B, L, H)         hidden states for each time step
-          hN:    (num_layers,B,H)  last hidden state
-          x_hat: (B, L, D)         prediction of x_{t+1} from h_t
+          h_seq: (B,L,H)
+          hN:    (num_layers,B,H)
         """
         h0 = self._ensure_h0(x_chunk, h0)
-
-        h_seq, hN = self.gru(x_chunk, h0)  # (B,L,H), (num_layers,B,H)
+        h_seq, hN = self.gru(x_chunk, h0)
         h_seq = self.ln(h_seq)
-        x_hat = self.pred_head(h_seq)      # (B,L,D)
-        return h_seq, hN, x_hat
+        return h_seq, hN
+
+    def classify_tokens(self, h_seq: torch.Tensor) -> torch.Tensor:
+        """h_seq: (B,L,H) -> logits: (B,L,3)"""
+        return self.head(h_seq)
 
     def classify_from_states(self, h_end: torch.Tensor) -> torch.Tensor:
-        """
-        h_end: (B, N_trials, H) or (B, H)
-        returns logits: (B, N_trials, 3) or (B, 3)
-        """
-        return self.cls_head(h_end)
-
-    def classify_rt_from_seq(self, h_seq: torch.Tensor) -> torch.Tensor:
-        """
-        h_seq: (B, L, H)
-        returns rt_logits: (B, L, 2) where classes are [standard, deviant]
-        """
-        return self.rt_head(h_seq)
+        """h_end: (B,N,H) or (B,H) -> logits: (B,N,3) or (B,3)"""
+        return self.head(h_end)

@@ -571,13 +571,21 @@ def compute_rt_from_logits(
     p_thresh: float,
     k_consec: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # at top of compute_rt_from_logits(...)
+    """
+    Return:
+      rt_tokens: (B,10) number of tokens needed to first reach correct+confident detection
+                 after deviant end, counted from 1.
+                 Example:
+                   first valid token immediately after deviant end -> 1
+                   second valid token -> 2
+      found:     (B,10) bool
+    """
     y_cls = y_cls.long()
     mn = int(y_cls.min().item())
     mx = int(y_cls.max().item())
     if mn < 0 or mx >= 3:
-        # fail fast with readable info
         raise ValueError(f"compute_rt_from_logits got invalid y_cls range [{mn},{mx}] (expected 0..2).")
+
     B, N, Tt, C = logits.shape
     assert N == 10 and C == 3
 
@@ -591,22 +599,26 @@ def compute_rt_from_logits(
     confident = py >= float(p_thresh)
     ok = correct & confident
 
+    # not found -> -1
     rt = torch.full((B, N), -1, dtype=torch.long, device=logits.device)
     found = torch.zeros((B, N), dtype=torch.bool, device=logits.device)
 
     K = int(max(1, k_consec))
     for b in range(B):
         for tr in range(N):
-            t0 = int(dev_end[b, tr].item()) + 1
+            t0 = int(dev_end[b, tr].item()) + 1  # first token AFTER deviant end
             if t0 >= Tt:
                 continue
+
             run = 0
             for t in range(t0, Tt):
                 if bool(ok[b, tr, t].item()):
                     run += 1
                     if run >= K:
                         first_t = t - K + 1
-                        rt[b, tr] = first_t - t0
+                        # 1-based token count:
+                        # first valid token after dev_end => first_t == t0 => rt = 1
+                        rt[b, tr] = (first_t - t0) + 1
                         found[b, tr] = True
                         break
                 else:
@@ -786,6 +798,8 @@ def train_one_epoch(
     token_ms: int = 10,
     tok_window_ms: int = 0,
     tok_start_offset_ms: int = 0,
+    rt_p_thresh: float = 0.7,
+    rt_k_consec: int = 3,
     debug: bool = False,
     debug_steps: int = 0,
     log_every: int = 50,
@@ -808,10 +822,15 @@ def train_one_epoch(
     total_tok = 0.0
     n_examples = 0
 
-    # for metrics
     y_true_all: List[np.ndarray] = []
     y_pred_all: List[np.ndarray] = []
     y_prob_all: List[np.ndarray] = []
+
+    # ---- NEW: RT tracking on TRAIN ----
+    rt_tokens_sum = 0.0
+    rt_ms_sum = 0.0
+    rt_n = 0
+    rt_miss = 0
 
     n_steps = len(loader)
     t_epoch0 = time.time()
@@ -823,7 +842,6 @@ def train_one_epoch(
         if debug_labels_first_n_batches and step <= int(debug_labels_first_n_batches) and debug_labels:
             print(f"[debug_labels] train batch {step} y(unique)={_unique_list(y)}")
 
-        # Check y at "batch_received" (CPU)
         _check_y_and_maybe_debug(
             y_cpu=y,
             where="train/batch_received",
@@ -841,14 +859,10 @@ def train_one_epoch(
 
         x = x.to(device, non_blocking=True)
 
-        # keep CPU labels for RT
-        y_cpu = y.long()  # CPU
-        # device labels for forward/masks/loss
+        y_cpu = y.long()
         y = y_cpu.to(device, non_blocking=True)
 
-        # after to(device)
         if debug_labels:
-            # bring back a copy to CPU and verify it still looks sane
             y_back = y.detach().to("cpu").long()
             _check_y_and_maybe_debug(
                 y_cpu=y_back,
@@ -875,7 +889,8 @@ def train_one_epoch(
             w = next(model.parameters())
             w0 = w.detach().float().cpu().clone()
 
-        logits_end, token_loss, _ = _run_block_through_tbptt(
+        # ---- IMPORTANT: return_full_logits=True so we can compute train RT ----
+        logits_end, token_loss, logits_all = _run_block_through_tbptt(
             model=model,
             x=x,
             y_pos_456=y,
@@ -891,7 +906,7 @@ def train_one_epoch(
             token_loss_mode=str(token_loss_mode),
             token_tau=float(token_tau),
             token_w_min=float(token_w_min),
-            return_full_logits=False,
+            return_full_logits=True,
         )
 
         y_cls = labels_to_class_index(y)
@@ -908,7 +923,6 @@ def train_one_epoch(
         total_end += float(end_loss.item()) * B
         total_tok += float(token_loss.item()) * B
 
-        # batch metrics collection
         with torch.no_grad():
             probs = torch.softmax(logits_end, dim=-1).detach().cpu().numpy().reshape(-1, 3)
             pred = probs.argmax(axis=1)
@@ -916,6 +930,47 @@ def train_one_epoch(
             y_true_all.append(yt)
             y_pred_all.append(pred)
             y_prob_all.append(probs)
+
+        # ---- NEW: compute TRAIN RT ----
+        if logits_all is None:
+            rt_miss += int(y_cls.numel())
+        else:
+            logits_trial = logits_all.view(B, 10, int(trial_T_tokens), 3).detach().to("cpu")
+            y_cpu_rt = y.detach().to("cpu").long()
+            y_cls_cpu = (y_cpu_rt - 4).long()
+
+            ymin = int(y_cls_cpu.min().item())
+            ymax = int(y_cls_cpu.max().item())
+            if ymin < 0 or ymax > 2:
+                uniq = torch.unique(y_cpu_rt).tolist()
+                uniq_cls = torch.unique(y_cls_cpu).tolist()
+                print(f"[TRAIN RT warn] invalid y values: unique y_pos_456={uniq} -> unique y_cls={uniq_cls}. Skip RT for this batch.")
+                rt_miss += int(y_cls_cpu.numel())
+            else:
+                dev_end_cpu = deviant_end_token_in_trial(
+                    y_pos_456=y_cpu_rt,
+                    tone_T=int(tone_T),
+                    isi_T=int(isi_T),
+                )
+
+                rt_tokens_cpu, found_cpu = compute_rt_from_logits(
+                    logits=logits_trial,
+                    y_cls=y_cls_cpu,
+                    dev_end=dev_end_cpu,
+                    p_thresh=float(rt_p_thresh),
+                    k_consec=int(rt_k_consec),
+                )
+
+                if found_cpu.any():
+                    rt_vals_tokens = rt_tokens_cpu[found_cpu].float()
+                    rt_tokens_sum += float(rt_vals_tokens.sum().item())
+
+                    rt_vals_ms = rt_vals_tokens * float(token_ms)
+                    rt_ms_sum += float(rt_vals_ms.sum().item())
+
+                    rt_n += int(rt_vals_tokens.numel())
+
+                rt_miss += int((~found_cpu).sum().item())
 
         if debug and step <= int(debug_steps):
             w1 = next(model.parameters()).detach().float().cpu()
@@ -937,14 +992,41 @@ def train_one_epoch(
             steps_left = max(0, n_steps - step)
             eta_epoch = ema_step * steps_left if ema_step is not None else float("nan")
             elapsed = time.time() - t_epoch0
-            # quick acc
+
             with torch.no_grad():
                 batch_acc = (torch.softmax(logits_end, dim=-1).argmax(dim=-1) == y_cls).float().mean().item()
+
+            batch_rt_msg = "batch_meanRT=NA"
+            if logits_all is not None:
+                logits_trial = logits_all.view(B, 10, int(trial_T_tokens), 3).detach().to("cpu")
+                y_cpu_rt = y.detach().to("cpu").long()
+                y_cls_cpu = (y_cpu_rt - 4).long()
+                ymin = int(y_cls_cpu.min().item())
+                ymax = int(y_cls_cpu.max().item())
+                if ymin >= 0 and ymax <= 2:
+                    dev_end_cpu = deviant_end_token_in_trial(
+                        y_pos_456=y_cpu_rt,
+                        tone_T=int(tone_T),
+                        isi_T=int(isi_T),
+                    )
+                    rt_tokens_cpu, found_cpu = compute_rt_from_logits(
+                        logits=logits_trial,
+                        y_cls=y_cls_cpu,
+                        dev_end=dev_end_cpu,
+                        p_thresh=float(rt_p_thresh),
+                        k_consec=int(rt_k_consec),
+                    )
+                    if found_cpu.any():
+                        batch_mean_rt_tokens = float(rt_tokens_cpu[found_cpu].float().mean().item())
+                        batch_mean_rt_ms = batch_mean_rt_tokens * float(token_ms)
+                        batch_rt_msg = f"batch_meanRT={batch_mean_rt_tokens:.2f}tok/{batch_mean_rt_ms:.1f}ms"
+
             print(
                 f"[train step {step:>4d}/{n_steps}] "
                 f"dt={dt:.2f}s ema={ema_step:.2f}s "
                 f"ETA_epoch={_fmt_hms(eta_epoch)} elapsed={_fmt_hms(elapsed)} "
-                f"end={end_loss.item():.4f} tok={float(token_loss.item()):.4f} acc={batch_acc:.3f}"
+                f"end={end_loss.item():.4f} tok={float(token_loss.item()):.4f} "
+                f"acc={batch_acc:.3f} {batch_rt_msg}"
             )
 
     denom = max(1, n_examples)
@@ -956,6 +1038,9 @@ def train_one_epoch(
     f1 = safe_f1_macro(y_true, y_pred) if y_true.size > 0 else float("nan")
     auc = safe_auc_ovr(y_true, y_prob, n_classes=3) if y_true.size > 0 else float("nan")
 
+    mean_rt_tokens = (rt_tokens_sum / rt_n) if rt_n > 0 else float("nan")
+    mean_rt_ms = (rt_ms_sum / rt_n) if rt_n > 0 else float("nan")
+
     return {
         "end_loss": total_end / denom,
         "token_loss": total_tok / denom,
@@ -963,10 +1048,15 @@ def train_one_epoch(
         "acc": acc,
         "f1_macro": float(f1),
         "auc_ovr": float(auc),
+        "mean_rt_tokens": float(mean_rt_tokens),
+        "mean_rt_ms": float(mean_rt_ms),
+        "rt_found": int(rt_n),
+        "rt_miss": int(rt_miss),
         "epoch_time_sec": time.time() - t_epoch0,
     }
 
 
+@torch.no_grad()
 @torch.no_grad()
 def evaluate(
     model: PredictiveGRU,
@@ -1001,18 +1091,18 @@ def evaluate(
     total_tok = 0.0
     n_examples = 0
 
-    # metrics
     y_true_all: List[np.ndarray] = []
     y_pred_all: List[np.ndarray] = []
     y_prob_all: List[np.ndarray] = []
 
-    rt_sum = 0.0
+    # ---- NEW ----
+    rt_tokens_sum = 0.0
+    rt_ms_sum = 0.0
     rt_n = 0
     rt_miss = 0
 
     for x, y in loader:
         if debug_labels_first_n_batches and debug_labels:
-            # eval 的 batch 数一般少，这里直接都打印也行；按你的参数控制
             print(f"[debug_labels] eval batch y(unique)={_unique_list(y)}")
 
         _check_y_and_maybe_debug(
@@ -1027,8 +1117,9 @@ def evaluate(
             dump_tensors=None,
             max_dumps=debug_labels_max_dumps,
         )
+
         x = x.to(device, non_blocking=True)
-        y_cpu = y.long()  # keep clean CPU
+        y_cpu = y.long()
         y = y_cpu.to(device, non_blocking=True)
         B, T, D = x.shape
         n_examples += B
@@ -1060,7 +1151,6 @@ def evaluate(
         total_end += float(end_loss.item()) * B
         total_tok += float(token_loss.item()) * B
 
-        # metrics collection
         probs = torch.softmax(logits_end, dim=-1).detach().cpu().numpy().reshape(-1, 3)
         pred = probs.argmax(axis=1)
         yt = y_cls.detach().cpu().numpy().reshape(-1)
@@ -1071,27 +1161,24 @@ def evaluate(
         if logits_all is None:
             rt_miss += int(y_cls.numel())
         else:
-            # ---- RT on CPU (robust: recompute y_cls on CPU + sanity checks) ----
             logits_trial = logits_all.view(B, 10, int(trial_T_tokens), 3)
 
             logits_trial_cpu = logits_trial.detach().to("cpu")
             y_cpu = y.detach().to("cpu").long()
-
-            # Recompute class labels on CPU from y_pos_456 to avoid any device-side corruption
             y_cls_cpu = (y_cpu - 4).long()
 
-            # Sanity check: must be in {0,1,2}
             ymin = int(y_cls_cpu.min().item())
             ymax = int(y_cls_cpu.max().item())
             if ymin < 0 or ymax > 2:
-                # dump diagnostics once per batch
                 uniq = torch.unique(y_cpu).tolist()
                 uniq_cls = torch.unique(y_cls_cpu).tolist()
                 print(f"[RT warn] invalid y values for RT: unique y_pos_456={uniq} -> unique y_cls={uniq_cls}. Skip RT for this batch.")
                 rt_miss += int(y_cls_cpu.numel())
             else:
                 dev_end_cpu = deviant_end_token_in_trial(
-                    y_pos_456=y_cpu, tone_T=int(tone_T), isi_T=int(isi_T)
+                    y_pos_456=y_cpu,
+                    tone_T=int(tone_T),
+                    isi_T=int(isi_T),
                 )
 
                 rt_tokens_cpu, found_cpu = compute_rt_from_logits(
@@ -1103,13 +1190,17 @@ def evaluate(
                 )
 
                 if found_cpu.any():
-                    rt_vals = rt_tokens_cpu[found_cpu].float() * float(token_ms)
-                    rt_sum += float(rt_vals.sum().item())
-                    rt_n += int(rt_vals.numel())
+                    rt_vals_tokens = rt_tokens_cpu[found_cpu].float()
+                    rt_tokens_sum += float(rt_vals_tokens.sum().item())
+
+                    rt_vals_ms = rt_vals_tokens * float(token_ms)
+                    rt_ms_sum += float(rt_vals_ms.sum().item())
+
+                    rt_n += int(rt_vals_tokens.numel())
+
                 rt_miss += int((~found_cpu).sum().item())
 
     denom = max(1, n_examples)
-    mean_rt_ms = (rt_sum / rt_n) if rt_n > 0 else float("nan")
 
     y_true = np.concatenate(y_true_all) if y_true_all else np.array([], dtype=np.int64)
     y_pred = np.concatenate(y_pred_all) if y_pred_all else np.array([], dtype=np.int64)
@@ -1119,6 +1210,9 @@ def evaluate(
     f1 = safe_f1_macro(y_true, y_pred) if y_true.size > 0 else float("nan")
     auc = safe_auc_ovr(y_true, y_prob, n_classes=3) if y_true.size > 0 else float("nan")
 
+    mean_rt_tokens = (rt_tokens_sum / rt_n) if rt_n > 0 else float("nan")
+    mean_rt_ms = (rt_ms_sum / rt_n) if rt_n > 0 else float("nan")
+
     return {
         "end_loss": total_end / denom,
         "token_loss": total_tok / denom,
@@ -1126,9 +1220,10 @@ def evaluate(
         "acc": acc,
         "f1_macro": float(f1),
         "auc_ovr": float(auc),
-        "mean_rt_ms": mean_rt_ms,
-        "rt_found": rt_n,
-        "rt_miss": rt_miss,
+        "mean_rt_tokens": float(mean_rt_tokens),
+        "mean_rt_ms": float(mean_rt_ms),
+        "rt_found": int(rt_n),
+        "rt_miss": int(rt_miss),
     }
 
 # ============================================================
@@ -1711,14 +1806,16 @@ def run_curriculum_training(
     jsonl_path = run_dir / "logs" / "metrics.jsonl"
     csv_path = run_dir / "logs" / "metrics.csv"
     header = [
-        "epoch_global", "stage", "isi_ms",
+        "epoch_global", "stage", "isi_ms", "token_ms",
         "train_total_loss", "train_end_loss", "train_token_loss", "train_acc", "train_f1_macro", "train_auc_ovr",
+        "train_mean_rt_tokens", "train_mean_rt_ms", "train_rt_found", "train_rt_miss",
         "val_total_loss", "val_end_loss", "val_token_loss", "val_acc", "val_f1_macro", "val_auc_ovr",
-        "val_mean_rt_ms", "val_rt_found", "val_rt_miss",
+        "val_mean_rt_tokens", "val_mean_rt_ms", "val_rt_found", "val_rt_miss",
         "best_val", "best_epoch",
         "best_target_isi_val", "best_target_isi_epoch", "best_target_isi",
         "time_elapsed_sec",
     ]
+
 
     patience = int(getattr(args, "early_stop_patience", 0))
     min_delta = float(getattr(args, "early_stop_min_delta", 0.0))
@@ -1790,15 +1887,17 @@ def run_curriculum_training(
                 trial_T_tokens=int(ds.trial_T_tokens),
                 tone_T=int(ds.tone_T),
                 isi_T=int(ds.isi_T),
-                token_loss_mode=str(args.token_loss_mode),
-                token_tau=float(args.token_tau),
-                token_w_min=float(args.token_w_min),
-                debug=bool(getattr(args, "debug", False)),
-                debug_steps=int(getattr(args, "debug_steps", 0)),
-                log_every=int(args.log_every),
                 token_ms=int(ds.token_ms),
                 tok_window_ms=int(getattr(args, "tok_window_ms", 0)),
                 tok_start_offset_ms=int(getattr(args, "tok_start_offset_ms", 0)),
+                rt_p_thresh=float(args.rt_p_thresh),
+                rt_k_consec=int(args.rt_k_consec),
+                debug=bool(getattr(args, "debug", False)),
+                debug_steps=int(getattr(args, "debug_steps", 0)),
+                log_every=int(args.log_every),
+                token_loss_mode=str(args.token_loss_mode),
+                token_tau=float(args.token_tau),
+                token_w_min=float(args.token_w_min),
                 debug_labels=bool(getattr(args, "debug_labels", False)),
                 debug_labels_fatal=bool(getattr(args, "debug_labels_fatal", False)),
                 debug_labels_dump=bool(getattr(args, "debug_labels_dump", False)),
@@ -1807,6 +1906,7 @@ def run_curriculum_training(
                 debug_labels_first_n_batches=int(getattr(args, "debug_labels_first_n_batches", 0)),
                 epoch_global=int(epoch_global),
             )
+
 
             va = evaluate(
                 model=model,
@@ -1868,10 +1968,11 @@ def run_curriculum_training(
                 target_msg = f" target_best={best_target_val:.4f}@{best_target_epoch}"
 
             print(
-                f"[epoch {epoch_global:04d}] (stage={stage} isi={isi_ms}) "
-                f"train: loss={tr['total_loss']:.4f} acc={tr['acc']:.4f} f1={tr['f1_macro']:.4f} auc={tr['auc_ovr']:.4f} | "
+                f"[epoch {epoch_global:04d}] (stage={stage} isi={isi_ms} token_ms={ds.token_ms}) "
+                f"train: loss={tr['total_loss']:.4f} acc={tr['acc']:.4f} f1={tr['f1_macro']:.4f} auc={tr['auc_ovr']:.4f} "
+                f"meanRT={tr['mean_rt_tokens']:.2f}tok/{tr['mean_rt_ms']:.1f}ms found={tr['rt_found']} miss={tr['rt_miss']} | "
                 f"val: loss={va['total_loss']:.4f} acc={va['acc']:.4f} f1={va['f1_macro']:.4f} auc={va['auc_ovr']:.4f} "
-                f"meanRT={va['mean_rt_ms']:.1f}ms found={va['rt_found']} miss={va['rt_miss']} | "
+                f"meanRT={va['mean_rt_tokens']:.2f}tok/{va['mean_rt_ms']:.1f}ms found={va['rt_found']} miss={va['rt_miss']} | "
                 f"best_val={best_val:.4f}@{best_epoch} stage_bad={stage_bad_count}/{patience} "
                 f"elapsed={_fmt_hms(elapsed)}{target_msg}"
             )
@@ -1901,21 +2002,30 @@ def run_curriculum_training(
                 "epoch_global": epoch_global,
                 "stage": stage,
                 "isi_ms": isi_ms,
+                "token_ms": int(ds.token_ms),
+
                 "train_total_loss": tr["total_loss"],
                 "train_end_loss": tr["end_loss"],
                 "train_token_loss": tr["token_loss"],
                 "train_acc": tr["acc"],
                 "train_f1_macro": tr["f1_macro"],
                 "train_auc_ovr": tr["auc_ovr"],
+                "train_mean_rt_tokens": tr["mean_rt_tokens"],
+                "train_mean_rt_ms": tr["mean_rt_ms"],
+                "train_rt_found": tr["rt_found"],
+                "train_rt_miss": tr["rt_miss"],
+
                 "val_total_loss": va["total_loss"],
                 "val_end_loss": va["end_loss"],
                 "val_token_loss": va["token_loss"],
                 "val_acc": va["acc"],
                 "val_f1_macro": va["f1_macro"],
                 "val_auc_ovr": va["auc_ovr"],
+                "val_mean_rt_tokens": va["mean_rt_tokens"],
                 "val_mean_rt_ms": va["mean_rt_ms"],
                 "val_rt_found": va["rt_found"],
                 "val_rt_miss": va["rt_miss"],
+
                 "best_val": best_val,
                 "best_epoch": best_epoch,
                 "best_target_isi_val": best_target_val,
@@ -1923,6 +2033,7 @@ def run_curriculum_training(
                 "best_target_isi": best_target_isi,
                 "time_elapsed_sec": elapsed,
             }
+
             write_jsonl(jsonl_path, row)
             write_csv_row(csv_path, header, row)
             history.append(row)
@@ -2184,6 +2295,9 @@ def main():
                    help="例如 '0.6,0.7,0.8'；空=不 sweep(用当前 rt_p_thresh)")
     p.add_argument("--sweep_rt_k_consec", type=str, default="",
                    help="例如 '1,2,3,4'；空=不 sweep(用当前 rt_k_consec)")
+    p.add_argument("--sweep_token_ms", type=str, default="",
+                help="例如 '1,2,5,10,25,50'；空=不 sweep(用当前 token_ms)")
+
 
     args = p.parse_args()
 
@@ -2244,25 +2358,27 @@ def main():
     sigmas_sil = parse_list_of_floats(args.sweep_sigma_silence) or [float(args.sigma_silence_noise)]
     rt_ps = parse_list_of_floats(args.sweep_rt_p_thresh) or [float(args.rt_p_thresh)]
     rt_ks = parse_list_of_ints(args.sweep_rt_k_consec) or [int(args.rt_k_consec)]
+    token_mss = parse_list_of_ints(args.sweep_token_ms) or [int(args.token_ms)]
 
-    combos = list(itertools.product(sigmas_other, p_others, sigmas_sil, rt_ps, rt_ks))
+    combos = list(itertools.product(sigmas_other, p_others, sigmas_sil, rt_ps, rt_ks, token_mss))
     print(f"[sweep] total combinations: {len(combos)}")
     print(f"[sweep] sigma_other: {sigmas_other}")
     print(f"[sweep] p_other: {p_others}")
     print(f"[sweep] sigma_silence: {sigmas_sil}")
     print(f"[sweep] rt_p_thresh: {rt_ps}")
     print(f"[sweep] rt_k_consec: {rt_ks}")
+    print(f"[sweep] token_ms: {token_mss}")
 
-    for i, (sigma_other, p_other, sigma_sil, rt_p, rt_k) in enumerate(combos, start=1):
-        # fresh args copy per run
+
+    for i, (sigma_other, p_other, sigma_sil, rt_p, rt_k, token_ms) in enumerate(combos, start=1):
         run_args = copy.deepcopy(args)
         run_args.sigma_other_noise = float(sigma_other)
         run_args.p_other_noise = float(p_other)
         run_args.sigma_silence_noise = float(sigma_sil)
         run_args.rt_p_thresh = float(rt_p)
         run_args.rt_k_consec = int(rt_k)
+        run_args.token_ms = int(token_ms)
 
-        # run dir naming
         parts = {
             "i": i,
             "sig_other": sigma_other,
@@ -2270,7 +2386,9 @@ def main():
             "sig_sil": sigma_sil,
             "rtp": rt_p,
             "rtk": rt_k,
+            "tokms": token_ms,
         }
+
         run_name = make_run_name(parts)
         run_dir = root / run_name
 
@@ -2284,10 +2402,12 @@ def main():
             "sigma_silence_noise": float(sigma_sil),
             "rt_p_thresh": float(rt_p),
             "rt_k_consec": int(rt_k),
+            "token_ms": int(token_ms),
             "isi_schedule": list(run_args.isi_schedule),
             "combo_index": i,
             "combo_total": len(combos),
         }
+
         run_curriculum_training(args=run_args, run_dir=run_dir, sweep_info=sweep_info)
 
     print(f"\n[sweep done] all runs saved under: {root.resolve()}")

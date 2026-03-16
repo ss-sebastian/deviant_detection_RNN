@@ -744,7 +744,7 @@ def _run_block_through_tbptt(
             h_end = h_seq.index_select(dim=1, index=rel)
             collected_end_logits.append(model.classify_from_states(h_end))
 
-        h = h.detach()
+        h = (h[0].detach(), h[1].detach()) if isinstance(h, tuple) else h.detach()
 
     if len(collected_end_logits) == 0:
         raise RuntimeError("No trial-end states collected. Check end_idx and T.")
@@ -826,11 +826,11 @@ def train_one_epoch(
     y_pred_all: List[np.ndarray] = []
     y_prob_all: List[np.ndarray] = []
 
-    # ---- NEW: RT tracking on TRAIN ----
     rt_tokens_sum = 0.0
     rt_ms_sum = 0.0
     rt_n = 0
     rt_miss = 0
+    rt_not_first = 0
 
     n_steps = len(loader)
     t_epoch0 = time.time()
@@ -858,7 +858,6 @@ def train_one_epoch(
         t0 = time.time()
 
         x = x.to(device, non_blocking=True)
-
         y_cpu = y.long()
         y = y_cpu.to(device, non_blocking=True)
 
@@ -889,7 +888,6 @@ def train_one_epoch(
             w = next(model.parameters())
             w0 = w.detach().float().cpu().clone()
 
-        # ---- IMPORTANT: return_full_logits=True so we can compute train RT ----
         logits_end, token_loss, logits_all = _run_block_through_tbptt(
             model=model,
             x=x,
@@ -931,7 +929,6 @@ def train_one_epoch(
             y_pred_all.append(pred)
             y_prob_all.append(probs)
 
-        # ---- NEW: compute TRAIN RT ----
         if logits_all is None:
             rt_miss += int(y_cls.numel())
         else:
@@ -964,11 +961,10 @@ def train_one_epoch(
                 if found_cpu.any():
                     rt_vals_tokens = rt_tokens_cpu[found_cpu].float()
                     rt_tokens_sum += float(rt_vals_tokens.sum().item())
-
                     rt_vals_ms = rt_vals_tokens * float(token_ms)
                     rt_ms_sum += float(rt_vals_ms.sum().item())
-
                     rt_n += int(rt_vals_tokens.numel())
+                    rt_not_first += int((rt_tokens_cpu[found_cpu] > 1).sum().item())
 
                 rt_miss += int((~found_cpu).sum().item())
 
@@ -1040,6 +1036,7 @@ def train_one_epoch(
 
     mean_rt_tokens = (rt_tokens_sum / rt_n) if rt_n > 0 else float("nan")
     mean_rt_ms = (rt_ms_sum / rt_n) if rt_n > 0 else float("nan")
+    rt_not_first_rate = (rt_not_first / rt_n) if rt_n > 0 else float("nan")
 
     return {
         "end_loss": total_end / denom,
@@ -1052,11 +1049,12 @@ def train_one_epoch(
         "mean_rt_ms": float(mean_rt_ms),
         "rt_found": int(rt_n),
         "rt_miss": int(rt_miss),
+        "rt_not_first": int(rt_not_first),
+        "rt_not_first_rate": float(rt_not_first_rate),
         "epoch_time_sec": time.time() - t_epoch0,
     }
 
 
-@torch.no_grad()
 @torch.no_grad()
 def evaluate(
     model: PredictiveGRU,
@@ -1095,11 +1093,11 @@ def evaluate(
     y_pred_all: List[np.ndarray] = []
     y_prob_all: List[np.ndarray] = []
 
-    # ---- NEW ----
     rt_tokens_sum = 0.0
     rt_ms_sum = 0.0
     rt_n = 0
     rt_miss = 0
+    rt_not_first = 0
 
     for x, y in loader:
         if debug_labels_first_n_batches and debug_labels:
@@ -1162,7 +1160,6 @@ def evaluate(
             rt_miss += int(y_cls.numel())
         else:
             logits_trial = logits_all.view(B, 10, int(trial_T_tokens), 3)
-
             logits_trial_cpu = logits_trial.detach().to("cpu")
             y_cpu = y.detach().to("cpu").long()
             y_cls_cpu = (y_cpu - 4).long()
@@ -1192,11 +1189,10 @@ def evaluate(
                 if found_cpu.any():
                     rt_vals_tokens = rt_tokens_cpu[found_cpu].float()
                     rt_tokens_sum += float(rt_vals_tokens.sum().item())
-
                     rt_vals_ms = rt_vals_tokens * float(token_ms)
                     rt_ms_sum += float(rt_vals_ms.sum().item())
-
                     rt_n += int(rt_vals_tokens.numel())
+                    rt_not_first += int((rt_tokens_cpu[found_cpu] > 1).sum().item())
 
                 rt_miss += int((~found_cpu).sum().item())
 
@@ -1212,6 +1208,7 @@ def evaluate(
 
     mean_rt_tokens = (rt_tokens_sum / rt_n) if rt_n > 0 else float("nan")
     mean_rt_ms = (rt_ms_sum / rt_n) if rt_n > 0 else float("nan")
+    rt_not_first_rate = (rt_not_first / rt_n) if rt_n > 0 else float("nan")
 
     return {
         "end_loss": total_end / denom,
@@ -1224,7 +1221,10 @@ def evaluate(
         "mean_rt_ms": float(mean_rt_ms),
         "rt_found": int(rt_n),
         "rt_miss": int(rt_miss),
+        "rt_not_first": int(rt_not_first),
+        "rt_not_first_rate": float(rt_not_first_rate),
     }
+
 
 # ============================================================
 # (NEW) Export trial-level RTs on VAL using BEST checkpoint
@@ -1744,7 +1744,6 @@ def run_curriculum_training(
     device = resolve_device(args.device)
     print(f"[device] using: {device}")
 
-    # ---- base dataset just to get input_dim + label sanity + splits ----
     base_ds = OnlineRenderDataset(
         data_dir=Path(args.data_dir),
         seed=args.seed,
@@ -1788,7 +1787,6 @@ def run_curriculum_training(
         weight_decay=float(args.weight_decay),
     )
 
-    # ---- resume (optional) ----
     start_epoch_global = 1
     best_val = float("inf")
     best_epoch = 0
@@ -1802,25 +1800,24 @@ def run_curriculum_training(
         best_epoch = int(ckpt.get("best_epoch", best_epoch))
         print(f"[resume] loaded: {args.resume} start_epoch_global={start_epoch_global}")
 
-    # ---- logs ----
     jsonl_path = run_dir / "logs" / "metrics.jsonl"
     csv_path = run_dir / "logs" / "metrics.csv"
     header = [
         "epoch_global", "stage", "isi_ms", "token_ms",
         "train_total_loss", "train_end_loss", "train_token_loss", "train_acc", "train_f1_macro", "train_auc_ovr",
         "train_mean_rt_tokens", "train_mean_rt_ms", "train_rt_found", "train_rt_miss",
+        "train_rt_not_first", "train_rt_not_first_rate",
         "val_total_loss", "val_end_loss", "val_token_loss", "val_acc", "val_f1_macro", "val_auc_ovr",
         "val_mean_rt_tokens", "val_mean_rt_ms", "val_rt_found", "val_rt_miss",
+        "val_rt_not_first", "val_rt_not_first_rate",
         "best_val", "best_epoch",
         "best_target_isi_val", "best_target_isi_epoch", "best_target_isi",
         "time_elapsed_sec",
     ]
 
-
     patience = int(getattr(args, "early_stop_patience", 0))
     min_delta = float(getattr(args, "early_stop_min_delta", 0.0))
 
-    # ---- target-ISI best tracking (e.g., 700) ----
     best_target_isi = int(getattr(args, "analysis_isi", 700))
     best_target_val = float("inf")
     best_target_epoch = 0
@@ -1834,11 +1831,8 @@ def run_curriculum_training(
         isi_ms = int(isi_ms)
         print(f"\n[curriculum] stage={stage}/{len(args.isi_schedule)}  isi_ms={isi_ms}")
 
-        # ---- stage-local early stopping state (RESET EACH STAGE) ----
         stage_best_val = float("inf")
         stage_bad_count = 0
-
-        # ---- stage-best snapshot (captured ONLY when improved) ----
         stage_best_state: Optional[Dict[str, torch.Tensor]] = None
         stage_best_optim: Optional[Dict[str, Any]] = None
         stage_best_epoch_global: Optional[int] = None
@@ -1872,7 +1866,6 @@ def run_curriculum_training(
             f"{end_preview[:3].tolist()} ... {end_preview[-3:].tolist()}"
         )
 
-        # ---- epoch loop for this stage ----
         for _e in range(1, int(args.epochs_per_isi) + 1):
             epoch_global += 1
 
@@ -1907,7 +1900,6 @@ def run_curriculum_training(
                 epoch_global=int(epoch_global),
             )
 
-
             va = evaluate(
                 model=model,
                 loader=val_loader,
@@ -1936,13 +1928,11 @@ def run_curriculum_training(
 
             elapsed = time.time() - t_run0
 
-            # ---- GLOBAL best (across all stages): best.pt ----
             improved_global = (va["total_loss"] < (best_val - min_delta))
             if improved_global:
                 best_val = float(va["total_loss"])
                 best_epoch = int(epoch_global)
 
-            # ---- TARGET-ISI best: best_isi{analysis_isi}.pt ----
             improved_target = False
             if int(isi_ms) == int(best_target_isi):
                 improved_target = (va["total_loss"] < (best_target_val - min_delta))
@@ -1950,13 +1940,10 @@ def run_curriculum_training(
                     best_target_val = float(va["total_loss"])
                     best_target_epoch = int(epoch_global)
 
-            # ---- STAGE-local best + early stopping ----
             improved_stage = (va["total_loss"] < (stage_best_val - min_delta))
             if improved_stage:
                 stage_best_val = float(va["total_loss"])
                 stage_bad_count = 0
-
-                # snapshot stage-best model+optim (cpu clone)
                 stage_best_state = {k: v.detach().to("cpu").clone() for k, v in model.state_dict().items()}
                 stage_best_optim = copy.deepcopy(optim.state_dict())
                 stage_best_epoch_global = int(epoch_global)
@@ -1970,9 +1957,9 @@ def run_curriculum_training(
             print(
                 f"[epoch {epoch_global:04d}] (stage={stage} isi={isi_ms} token_ms={ds.token_ms}) "
                 f"train: loss={tr['total_loss']:.4f} acc={tr['acc']:.4f} f1={tr['f1_macro']:.4f} auc={tr['auc_ovr']:.4f} "
-                f"meanRT={tr['mean_rt_tokens']:.2f}tok/{tr['mean_rt_ms']:.1f}ms found={tr['rt_found']} miss={tr['rt_miss']} | "
+                f"meanRT={tr['mean_rt_tokens']:.2f}tok/{tr['mean_rt_ms']:.1f}ms found={tr['rt_found']} miss={tr['rt_miss']} not_first={tr['rt_not_first']}({tr['rt_not_first_rate']:.1%}) | "
                 f"val: loss={va['total_loss']:.4f} acc={va['acc']:.4f} f1={va['f1_macro']:.4f} auc={va['auc_ovr']:.4f} "
-                f"meanRT={va['mean_rt_tokens']:.2f}tok/{va['mean_rt_ms']:.1f}ms found={va['rt_found']} miss={va['rt_miss']} | "
+                f"meanRT={va['mean_rt_tokens']:.2f}tok/{va['mean_rt_ms']:.1f}ms found={va['rt_found']} miss={va['rt_miss']} not_first={va['rt_not_first']}({va['rt_not_first_rate']:.1%}) | "
                 f"best_val={best_val:.4f}@{best_epoch} stage_bad={stage_bad_count}/{patience} "
                 f"elapsed={_fmt_hms(elapsed)}{target_msg}"
             )
@@ -2014,6 +2001,8 @@ def run_curriculum_training(
                 "train_mean_rt_ms": tr["mean_rt_ms"],
                 "train_rt_found": tr["rt_found"],
                 "train_rt_miss": tr["rt_miss"],
+                "train_rt_not_first": tr["rt_not_first"],
+                "train_rt_not_first_rate": tr["rt_not_first_rate"],
 
                 "val_total_loss": va["total_loss"],
                 "val_end_loss": va["end_loss"],
@@ -2025,6 +2014,8 @@ def run_curriculum_training(
                 "val_mean_rt_ms": va["mean_rt_ms"],
                 "val_rt_found": va["rt_found"],
                 "val_rt_miss": va["rt_miss"],
+                "val_rt_not_first": va["rt_not_first"],
+                "val_rt_not_first_rate": va["rt_not_first_rate"],
 
                 "best_val": best_val,
                 "best_epoch": best_epoch,
@@ -2041,15 +2032,13 @@ def run_curriculum_training(
             if int(getattr(args, "plot_every", 0)) > 0 and (epoch_global % int(args.plot_every) == 0):
                 plot_history(history, run_dir / "plots" / "dummy.png")
 
-            # ---- stage-local early stop: break out of epoch loop ----
             if patience > 0 and stage_bad_count >= patience:
                 print(
                     f"[early_stop] stage {stage} (isi={isi_ms}) patience reached: "
                     f"{stage_bad_count}/{patience}. End this stage."
                 )
-                break  # IMPORTANT: do NOT restore here; do it once after loop
+                break
 
-        # ---- STAGE END: restore ONCE to stage-best before next stage ----
         if stage_best_state is not None:
             model.load_state_dict(stage_best_state, strict=True)
             if stage_best_optim is not None:
@@ -2064,7 +2053,6 @@ def run_curriculum_training(
                 f"(If you set epochs_per_isi=0, or val crashed, this can happen.)"
             )
 
-    # ---- final plots / summary ----
     plot_history(history, run_dir / "plots" / "dummy.png")
     print(f"[done] Saved run to: {run_dir.resolve()}")
     print("  - best.pt / last.pt")
@@ -2073,7 +2061,6 @@ def run_curriculum_training(
     print("  - logs/metrics.jsonl + logs/metrics.csv")
     print("  - plots/acc.png f1.png auc.png loss.png")
 
-    # ---- post-run analysis (optional): export model_trial.csv from best_isi{analysis_isi}.pt first ----
     if bool(getattr(args, "run_post_analysis", False)):
         human_csv = Path(str(getattr(args, "human_trial_csv", ""))).expanduser()
         isi_for_export = int(getattr(args, "analysis_isi", 700))
@@ -2126,6 +2113,7 @@ def run_curriculum_training(
                 print(f"[analysis] position-effect analysis failed: {e}")
         else:
             print("[analysis] model_csv export failed; skip analysis.")
+
 # -------------------------
 # Main
 # -------------------------

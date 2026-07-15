@@ -26,6 +26,9 @@ class GMConfig:
 
     # exclude these exact frequencies (Hz)
     exclude_freqs: Tuple[float, ...] = (1455.0, 1500.0, 1600.0)
+    # exclude directed (standard, deviant) frequency pairs while still allowing
+    # those frequencies to appear in other pairings.
+    exclude_pairs: Tuple[Tuple[float, float], ...] = ()
 
     seed: int = 42
 
@@ -44,6 +47,37 @@ def _maybe_round(f: float, round_to: Optional[float]) -> float:
 def _is_excluded(f: float, exclude_freqs: Tuple[float, ...], tol: float) -> bool:
     for ex in exclude_freqs:
         if abs(float(f) - float(ex)) <= tol:
+            return True
+    return False
+
+
+def parse_exclude_pairs(values: Optional[List[str]]) -> Tuple[Tuple[float, float], ...]:
+    pairs: List[Tuple[float, float]] = []
+    for raw in values or []:
+        s = str(raw).strip()
+        if not s:
+            continue
+        parts = None
+        for sep in ("->", ",", ":", "/"):
+            if sep in s:
+                parts = s.split(sep, 1)
+                break
+        if parts is None or len(parts) != 2:
+            raise ValueError(
+                f"Invalid exclude pair {raw!r}. Use directed pairs like 1455,1500 or 1455->1500."
+            )
+        pairs.append((float(parts[0]), float(parts[1])))
+    return tuple(pairs)
+
+
+def _is_pair_excluded(
+    pair: Tuple[float, float],
+    exclude_pairs: Tuple[Tuple[float, float], ...],
+    tol: float,
+) -> bool:
+    f_std, f_dev = pair
+    for ex_std, ex_dev in exclude_pairs:
+        if abs(float(f_std) - float(ex_std)) <= tol and abs(float(f_dev) - float(ex_dev)) <= tol:
             return True
     return False
 
@@ -121,33 +155,84 @@ def sample_deviant_freq(grid: torch.Tensor, f_std: float, min_diff: float, g: to
 # -------------------------
 # Deviant position scheduling
 # -------------------------
+class PositionSampler:
+    """
+    Sample deviant positions with:
+      - no within-block balancing constraint
+      - exact global balance across consecutive span blocks
+
+    For the default 10 trials/block and span_blocks=3, every 3 consecutive blocks
+    together contain exactly 10x P4, 10x P5, and 10x P6, but any single block can
+    be highly imbalanced (e.g. 6/2/2 or 7/3/0).
+    """
+
+    def __init__(
+        self,
+        *,
+        trials_per_block: int,
+        dev_positions: Tuple[int, ...],
+        g: torch.Generator,
+        span_blocks: int = 3,
+    ) -> None:
+        if len(dev_positions) != 3:
+            raise ValueError("This sampler assumes exactly 3 deviant positions (e.g., 4/5/6).")
+        if trials_per_block <= 0:
+            raise ValueError("trials_per_block must be > 0.")
+        if span_blocks <= 0:
+            raise ValueError("span_blocks must be > 0.")
+
+        refill_size = int(trials_per_block) * int(span_blocks)
+        if refill_size % len(dev_positions) != 0:
+            raise ValueError(
+                "trials_per_block * span_blocks must be divisible by the number of deviant positions."
+            )
+
+        self.trials_per_block = int(trials_per_block)
+        self.dev_positions = tuple(int(v) for v in dev_positions)
+        self.g = g
+        self.span_blocks = int(span_blocks)
+        self.refill_size = refill_size
+        self._queue: List[int] = []
+
+    def _refill(self) -> None:
+        per_pos = self.refill_size // len(self.dev_positions)
+        refill: List[int] = []
+        for p in self.dev_positions:
+            refill.extend([int(p)] * per_pos)
+        perm = torch.randperm(len(refill), generator=self.g).tolist()
+        self._queue.extend(refill[i] for i in perm)
+
+    def sample_block(self) -> List[int]:
+        while len(self._queue) < self.trials_per_block:
+            self._refill()
+        out = list(self._queue[:self.trials_per_block])
+        self._queue = self._queue[self.trials_per_block:]
+        return out
+
+
 def make_block_position_schedule(
     block_idx_0: int,
     trials_per_block: int,
     dev_positions: Tuple[int, ...],
-    g: torch.Generator
+    g: torch.Generator,
+    sampler: Optional[PositionSampler] = None,
 ) -> List[int]:
     """
-    Within one block, make dev_pos distribution as even as possible.
-    For 10 trials and 3 positions -> 4/3/3. Which position gets the extra +1
-    rotates with block_idx_0 so that across many blocks the global ratio ~ 1/3.
-    Then shuffle within the block.
+    New default:
+      - within block: unconstrained random draw from a queue
+      - across consecutive span blocks: exactly balanced overall
+
+    block_idx_0 is kept for API compatibility but is not used directly here; the
+    sequential queue order is what carries the cross-block balance constraint.
     """
-    if len(dev_positions) != 3:
-        raise ValueError("This schedule assumes exactly 3 deviant positions (e.g., 4/5/6).")
-
-    base = trials_per_block // 3
-    rem = trials_per_block % 3
-    counts = [base, base, base]
-    for k in range(rem):
-        counts[(block_idx_0 + k) % 3] += 1
-
-    pos_list: List[int] = []
-    for p, c in zip(dev_positions, counts):
-        pos_list.extend([int(p)] * int(c))
-
-    perm = torch.randperm(len(pos_list), generator=g).tolist()
-    return [pos_list[i] for i in perm]
+    del block_idx_0
+    if sampler is None:
+        sampler = PositionSampler(
+            trials_per_block=trials_per_block,
+            dev_positions=dev_positions,
+            g=g,
+        )
+    return sampler.sample_block()
 
 
 # -------------------------
@@ -186,6 +271,8 @@ def sample_block_pair(
 
         pair = (float(f_std), float(f_dev))
 
+        if _is_pair_excluded(pair, cfg.exclude_pairs, exclude_tol):
+            continue
         if prev_pair is not None and pair == prev_pair:
             continue
         if seen_pairs is not None and pair in seen_pairs:
@@ -206,6 +293,8 @@ def sample_block_pair(
             f_dev = sample_deviant_freq(grid, f_std, cfg.min_diff, g)
 
         pair = (float(f_std), float(f_dev))
+        if _is_pair_excluded(pair, cfg.exclude_pairs, exclude_tol):
+            continue
         if prev_pair is None or pair != prev_pair:
             return float(f_std), float(f_dev)
 
@@ -220,11 +309,13 @@ def generate_one_block(
     exclude_tol: float,
     prev_pair: Optional[Tuple[float, float]],
     seen_pairs: Optional[Set[Tuple[float, float]]],
+    position_sampler: Optional[PositionSampler] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
     """
     One block:
       - fixed f_std and fixed f_dev across all 10 trials
-      - deviant position changes (4/5/6) with balanced schedule
+      - deviant positions are random within block, but balanced across consecutive
+        position-sampler spans
     Returns:
       freqs_hz: (10,8) float32
       labels:   (10,)  int64 values in {4,5,6}
@@ -246,6 +337,7 @@ def generate_one_block(
         trials_per_block=cfg.trials_per_block,
         dev_positions=cfg.deviant_positions,
         g=g,
+        sampler=position_sampler,
     )
     if len(pos_schedule) != cfg.trials_per_block:
         raise RuntimeError("Position schedule length mismatch.")
@@ -281,6 +373,13 @@ def main():
     p.add_argument("--seq_len", type=int, default=8)
 
     p.add_argument("--exclude_freqs", type=float, nargs="*", default=[1455.0, 1500.0, 1600.0])
+    p.add_argument(
+        "--exclude_pairs",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Directed std,dev pair exclusions, e.g. 1455,1500 1500,1455.",
+    )
     p.add_argument("--exclude_tol", type=float, default=1e-6, help="tolerance for excluding specific frequencies")
     p.add_argument("--no_seen_pairs", action="store_true", help="Do not avoid reusing (std,dev) pairs globally")
 
@@ -304,6 +403,7 @@ def main():
         f_step=args.f_step,
         min_diff=min_diff,
         exclude_freqs=tuple(float(v) for v in args.exclude_freqs),
+        exclude_pairs=parse_exclude_pairs(args.exclude_pairs),
         seed=args.seed,
     )
 
@@ -343,6 +443,11 @@ def main():
 
         prev_pair = None
         seen_pairs = None if args.no_seen_pairs else set()
+        position_sampler = PositionSampler(
+            trials_per_block=cfg.trials_per_block,
+            dev_positions=cfg.deviant_positions,
+            g=g,
+        )
 
         stds: List[float] = []
         devs: List[float] = []
@@ -358,6 +463,7 @@ def main():
                 exclude_tol=args.exclude_tol,
                 prev_pair=prev_pair,
                 seen_pairs=seen_pairs,
+                position_sampler=position_sampler,
             )
             prev_pair = (f_std, f_dev)
             X_all[b] = freqs
@@ -373,12 +479,14 @@ def main():
             "export_mode": "all" if export_mode_all else "first_n",
             "n_exported": int(n_export),
             "excluded_freqs_hz": list(cfg.exclude_freqs),
+            "excluded_pairs_hz": [[float(a), float(b)] for a, b in cfg.exclude_pairs],
             "exclude_tol": float(args.exclude_tol),
             "sample_mode": args.sample_mode,
             "round_to": args.round_to,
             "label_definition": "deviant position per trial (1-indexed in {4,5,6})",
             "input_definition": "Hz frequencies shaped (n_blocks, 10, 8)",
-            "within_block_position_balance": "balanced schedule per block; extra count rotates across blocks",
+            "within_block_position_balance": "none",
+            "across_block_position_balance": "exact over consecutive 3-block spans via shuffled 30-position queue (10x P4, 10x P5, 10x P6)",
             "block_standard_hz_first10": stds[:10],
             "block_deviant_hz_first10": devs[:10],
             "avoid_global_pair_reuse": (not args.no_seen_pairs),
@@ -403,6 +511,11 @@ def main():
 
         prev_pair = None
         seen_pairs = None if args.no_seen_pairs else set()
+        position_sampler = PositionSampler(
+            trials_per_block=cfg.trials_per_block,
+            dev_positions=cfg.deviant_positions,
+            g=g,
+        )
 
         for b in range(cfg.n_blocks):
             freqs, labels, f_std, f_dev = generate_one_block(
@@ -415,6 +528,7 @@ def main():
                 exclude_tol=args.exclude_tol,
                 prev_pair=prev_pair,
                 seen_pairs=seen_pairs,
+                position_sampler=position_sampler,
             )
             prev_pair = (f_std, f_dev)
             if b == target:
@@ -433,6 +547,7 @@ def main():
             "export_mode": "single",
             "exported_block_index": cfg.block_index,
             "excluded_freqs_hz": list(cfg.exclude_freqs),
+            "excluded_pairs_hz": [[float(a), float(b)] for a, b in cfg.exclude_pairs],
             "exclude_tol": float(args.exclude_tol),
             "sample_mode": args.sample_mode,
             "round_to": args.round_to,
@@ -440,7 +555,8 @@ def main():
             "block_deviant_hz": out_dev,
             "label_definition": "deviant position per trial (1-indexed in {4,5,6})",
             "input_definition": "Hz frequencies shaped (1, 10, 8)",
-            "within_block_position_balance": "balanced schedule per block; extra count rotates across blocks",
+            "within_block_position_balance": "none",
+            "across_block_position_balance": "exact over consecutive 3-block spans via shuffled 30-position queue (10x P4, 10x P5, 10x P6)",
             "avoid_global_pair_reuse": (not args.no_seen_pairs),
         })
         (save_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -450,6 +566,7 @@ def main():
         print(" -", (save_dir / "labels_tensor.pt").resolve(), "shape=", tuple(out_labels.shape))
         print(" - block standard/dev:", out_std, out_dev)
         print(" - excluded:", cfg.exclude_freqs)
+        print(" - excluded pairs:", cfg.exclude_pairs)
 
 
 if __name__ == "__main__":

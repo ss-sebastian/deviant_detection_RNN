@@ -12,31 +12,36 @@ import torch.nn as nn
 class ModelConfig:
     input_dim: int
     hidden_dim: int = 128
+    num_classes: int = 3
+    next_tone_num_classes: int = 2
     num_layers: int = 1
-    dropout: float = 0.0
+    dropout: float = 0.0  # GRU dropout only applies when num_layers>1
     layer_norm: bool = True
-
-
-# Type alias for LSTM state
-LSTMState = Tuple[torch.Tensor, torch.Tensor]
+    hidden_noise_std: float = 0.0
+    use_stop_head: bool = False
+    use_event_head: bool = False
+    use_next_tone_head: bool = False
+    # --- new: response head + position embedding ---
+    use_response_head: bool = False
+    add_tone_position_embedding: bool = False
+    tone_position_embed_dim: int = 16  # dim of learned position embedding
 
 
 class PredictiveGRU(nn.Module):
     """
-    LSTM backbone with a shared 3-class head (classes correspond to dev_pos {4,5,6}):
+    One GRU backbone, one shared class head.
 
-      - token_head: logits at each token (B,L,3)
-      - trial_end:  logits at selected end states (B,N_trials,3) using the same head
+      - token_head: logits at each token (B,L,C)
+      - trial_end:  logits at selected end states (B,N_trials,C) using the same head
 
-    h0 / hN are now (h, c) tuples as required by nn.LSTM.
-    The class is kept as PredictiveGRU for compatibility with existing checkpoints/code.
+    No binary rt_head anymore. RT is computed from token logits during evaluation.
     """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
 
-        self.rnn = nn.LSTM(
+        self.gru = nn.GRU(
             input_size=cfg.input_dim,
             hidden_size=cfg.hidden_dim,
             num_layers=cfg.num_layers,
@@ -45,51 +50,104 @@ class PredictiveGRU(nn.Module):
         )
 
         self.ln = nn.LayerNorm(cfg.hidden_dim) if cfg.layer_norm else nn.Identity()
-        self.head = nn.Linear(cfg.hidden_dim, 3)
+        self.head = nn.Linear(cfg.hidden_dim, int(cfg.num_classes))
+        self.stop_head = nn.Linear(cfg.hidden_dim, 1) if bool(cfg.use_stop_head) else None
+        self.event_head = nn.Linear(cfg.hidden_dim, 1) if bool(cfg.use_event_head) else None
+        self.next_tone_head = (
+            nn.Linear(cfg.hidden_dim, int(cfg.next_tone_num_classes))
+            if bool(cfg.use_next_tone_head)
+            else None
+        )
 
-    def _make_zero_state(self, x_chunk: torch.Tensor) -> LSTMState:
-        """Create (h_0, c_0) zero tensors matching batch size and device."""
+        # --- new: response head ---
+        self.response_head = nn.Linear(cfg.hidden_dim, 1) if bool(cfg.use_response_head) else None
+
+        # --- new: tone-position embedding (injected into hidden state) ---
+        if bool(cfg.add_tone_position_embedding):
+            self.tone_pos_embed = nn.Embedding(8, cfg.tone_position_embed_dim)
+            self.tone_pos_proj = nn.Linear(cfg.tone_position_embed_dim, cfg.hidden_dim)
+        else:
+            self.tone_pos_embed = None
+            self.tone_pos_proj = None
+
+    def _apply_training_hidden_noise(self, h_seq: torch.Tensor) -> torch.Tensor:
+        if (not self.training) or (float(self.cfg.hidden_noise_std) <= 0.0):
+            return h_seq
+        noise = torch.randn_like(h_seq) * float(self.cfg.hidden_noise_std)
+        return h_seq + noise
+
+    def _ensure_h0(self, x_chunk: torch.Tensor, h0: Optional[torch.Tensor]) -> torch.Tensor:
         B = int(x_chunk.shape[0])
         device = x_chunk.device
         dtype = x_chunk.dtype
-        shape = (self.cfg.num_layers, B, self.cfg.hidden_dim)
-        return (
-            torch.zeros(shape, device=device, dtype=dtype),
-            torch.zeros(shape, device=device, dtype=dtype),
-        )
-
-    def _ensure_state(
-        self,
-        x_chunk: torch.Tensor,
-        h0: Optional[LSTMState],
-    ) -> LSTMState:
-        """Return a valid (h, c) state, initialising to zeros if None."""
         if h0 is None:
-            return self._make_zero_state(x_chunk)
-        h, c = h0
-        device = x_chunk.device
-        dtype = x_chunk.dtype
-        return h.to(device=device, dtype=dtype), c.to(device=device, dtype=dtype)
+            return torch.zeros(
+                (self.cfg.num_layers, B, self.cfg.hidden_dim),
+                device=device,
+                dtype=dtype,
+            )
+        return h0.to(device=device, dtype=dtype)
 
     def forward_chunk(
         self,
-        x_chunk: torch.Tensor,            # (B, L, D)
-        h0: Optional[LSTMState] = None,
-    ) -> Tuple[torch.Tensor, LSTMState]:
+        x_chunk: torch.Tensor,           # (B,L,D)
+        h0: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns:
-          h_seq : (B, L, H)   — layer-normed output at every token
-          hN    : (h, c) tuple, each (num_layers, B, H)  — state to pass to next chunk
+        returns:
+          h_seq: (B,L,H)
+          hN:    (num_layers,B,H)
         """
-        state = self._ensure_state(x_chunk, h0)
-        h_seq, (hN, cN) = self.rnn(x_chunk, state)
+        h0 = self._ensure_h0(x_chunk, h0)
+        h_seq, hN = self.gru(x_chunk, h0)
         h_seq = self.ln(h_seq)
-        return h_seq, (hN, cN)
+        h_seq = self._apply_training_hidden_noise(h_seq)
+        return h_seq, hN
 
     def classify_tokens(self, h_seq: torch.Tensor) -> torch.Tensor:
-        """h_seq: (B, L, H)  ->  logits: (B, L, 3)"""
+        """h_seq: (B,L,H) -> logits: (B,L,C)"""
         return self.head(h_seq)
 
     def classify_from_states(self, h_end: torch.Tensor) -> torch.Tensor:
-        """h_end: (B, N, H) or (B, H)  ->  logits: (B, N, 3) or (B, 3)"""
+        """h_end: (B,N,H) or (B,H) -> logits: (B,N,C) or (B,C)"""
         return self.head(h_end)
+
+    def classify_stop(self, h_seq: torch.Tensor) -> Optional[torch.Tensor]:
+        """h_seq: (B,L,H) -> stop_logits: (B,L,1), or None when head disabled."""
+        if self.stop_head is None:
+            return None
+        return self.stop_head(h_seq)
+
+    def classify_event(self, h_seq: torch.Tensor) -> Optional[torch.Tensor]:
+        """h_seq: (B,L,H) -> event_logits: (B,L,1), or None when disabled."""
+        if self.event_head is None:
+            return None
+        return self.event_head(h_seq)
+
+    def classify_next_tone(self, h_seq: torch.Tensor) -> Optional[torch.Tensor]:
+        """h_seq: (B,L,H) -> next-tone logits: (B,L,C), or None when disabled."""
+        if self.next_tone_head is None:
+            return None
+        return self.next_tone_head(h_seq)
+
+    def classify_response(self, h_seq: torch.Tensor) -> Optional[torch.Tensor]:
+        """h_seq: (B,L,H) -> response_logits: (B,L,1). Returns p_respond after sigmoid."""
+        if self.response_head is None:
+            return None
+        return self.response_head(h_seq)
+
+    def inject_tone_position(self, h_seq: torch.Tensor, tone_positions: torch.Tensor) -> torch.Tensor:
+        """Add learned tone-position embedding to hidden states.
+
+        h_seq: (B, L, H)
+        tone_positions: (B, L) with values in {0..7}, or -1 for no position
+        Returns: h_seq with position embedding added
+        """
+        if self.tone_pos_embed is None or self.tone_pos_proj is None:
+            return h_seq
+        mask = (tone_positions >= 0) & (tone_positions < 8)
+        if not mask.any():
+            return h_seq
+        emb = self.tone_pos_embed(tone_positions.clamp(0, 7))  # (B, L, embed_dim)
+        proj = self.tone_pos_proj(emb)  # (B, L, H)
+        return h_seq + proj * mask.unsqueeze(-1).float()
